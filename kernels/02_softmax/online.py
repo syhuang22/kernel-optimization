@@ -21,57 +21,59 @@ from functools import partial
 
 def softmax_kernel(x_ref, o_ref, *, seq_len: int, block_size: int):
     """
-    x_ref: [block_size]  — current block of input
-    o_ref: [block_size]  — current block of output
+    Online softmax: 兩趟掃描，每趟每次只看 block_size 個元素。
 
-    Because we need a single-pass over the full row, we use lax.fori_loop
-    with scratchpad to accumulate (running_max, running_sum).
+    第一趟 (fori_loop): 邊掃邊更新 running_max 和 running_sum
+      每個 block:
+        m_new = max(m_old, block_max)
+        s_new = s_old * exp(m_old - m_new) + sum(exp(block - m_new))
 
-    NOTE: For TPU Pallas, scratchpad is declared via interpret=True or
-    via pl.VMEM scratch in grid_spec. Here we use a simple approach:
-    pass scratch refs via in_specs with has_side_effects.
+    第二趟 (fori_loop): 用最終 m, s 正規化並寫入輸出
+      output_block = exp(block - m_final) / s_final
     """
-    import jax.lax as lax
-
+    rows = x_ref.shape[0]          # rows_per_block，例如 16
     num_blocks = seq_len // block_size
-    row_idx = pl.program_id(0)  # which row we're computing
 
-    # We need to iterate over K blocks for row row_idx.
-    # This is tricky to do inside a single kernel call with standard BlockSpec.
-    # Solution: put all of seq_len in one block (block_size == seq_len),
-    # then compute properly. This is the "simple" version.
-    #
-    # For the real multi-block version, see online_multiblock.py.
+    # --- 第一趟：算 global max 和 global sum ---
+    def scan_body(j, carry):
+        m, s = carry                                               # [rows], [rows]
+        x_blk = x_ref[:, pl.dslice(j * block_size, block_size)]  # [rows, block_size]
+        x_blk = x_blk.astype(jnp.float32)
 
-    x = x_ref[...].astype(jnp.float32)
+        m_new = jnp.maximum(m, jnp.max(x_blk, axis=-1))          # [rows]
+        exp_blk = jnp.exp(x_blk - m_new[:, None])
+        s_new = s * jnp.exp(m - m_new) + jnp.sum(exp_blk, axis=-1)
+        return m_new, s_new
 
-    # Numerically stable softmax in one block
-    x_max = jnp.max(x)
-    x_shifted = x - x_max
-    exp_x = jnp.exp(x_shifted)
-    o_ref[...] = (exp_x / jnp.sum(exp_x)).astype(o_ref.dtype)
+    m_init = jnp.full((rows,), -jnp.inf, dtype=jnp.float32)
+    s_init = jnp.zeros((rows,), dtype=jnp.float32)
+    m_final, s_final = jax.lax.fori_loop(0, num_blocks, scan_body, (m_init, s_init))
+
+    # --- 第二趟：正規化，寫回輸出 ---
+    def norm_body(j, _):
+        x_blk = x_ref[:, pl.dslice(j * block_size, block_size)].astype(jnp.float32)
+        out_blk = jnp.exp(x_blk - m_final[:, None]) / s_final[:, None]
+        o_ref[:, pl.dslice(j * block_size, block_size)] = out_blk.astype(o_ref.dtype)
+
+    jax.lax.fori_loop(0, num_blocks, norm_body, None)
 
 
-def softmax(x: jax.Array, block_size: int | None = None) -> jax.Array:
+def softmax(x: jax.Array, rows_per_block: int = 16, block_size: int = 512) -> jax.Array:
     """
     x: [rows, seq_len]
-    Simple version: block covers full seq_len. Study this first.
+    rows_per_block: 每個 block 處理幾行（bf16 需是 16 的倍數）
+    block_size:     沿 seq 方向每次掃多少（必須是 128 的倍數）
     """
     rows, seq_len = x.shape
-    if block_size is None:
-        block_size = seq_len
-
+    assert rows % rows_per_block == 0
     assert seq_len % block_size == 0
-    assert block_size == seq_len, (
-        "Multi-block version not implemented yet. Set block_size=seq_len."
-    )
 
     return pl.pallas_call(
         partial(softmax_kernel, seq_len=seq_len, block_size=block_size),
         out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
-        grid=(rows,),
-        in_specs=[pl.BlockSpec((1, seq_len), lambda i: (i, 0))],
-        out_specs=pl.BlockSpec((1, seq_len), lambda i: (i, 0)),
+        grid=(rows // rows_per_block,),
+        in_specs=[pl.BlockSpec((rows_per_block, seq_len), lambda i: (i, 0))],
+        out_specs=pl.BlockSpec((rows_per_block, seq_len), lambda i: (i, 0)),
     )(x)
 
 

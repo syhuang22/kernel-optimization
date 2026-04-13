@@ -15,15 +15,21 @@ import jax.experimental.pallas as pl
 def matmul_kernel(a_ref, b_ref, o_ref):
     # a_ref: [BM, BK], b_ref: [BK, BN], o_ref: [BM, BN]
     # pl.dot = MXU matmul, maps directly to TPU matrix unit
-    o_ref[...] = pl.dot(a_ref[...], b_ref[...])
+    o_ref[...] = pl.dot(a_ref[...], b_ref[...]).astype(o_ref.dtype)
 
 
-def matmul(a: jax.Array, b: jax.Array, bm: int = 128, bk: int = 128, bn: int = 128):
+def matmul(a: jax.Array, b: jax.Array, bm: int = 128, bk: int | None = None, bn: int = 128):
     m, k = a.shape
     _, n = b.shape
+    if bk is None:
+        bk = k  # naive: put all K in one block, no K-tiling
     assert m % bm == 0, f"M={m} not divisible by bm={bm}"
     assert k % bk == 0, f"K={k} not divisible by bk={bk}"
     assert n % bn == 0, f"N={n} not divisible by bn={bn}"
+    assert bk == k, (
+        f"naive.py requires bk==k (got bk={bk}, k={k}). "
+        "For K-tiling see tiled.py."
+    )
 
     return pl.pallas_call(
         matmul_kernel,
